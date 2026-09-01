@@ -1,0 +1,45 @@
+---
+- name: Check whether install or upgrade is required # noqa: package-latest
+  ansible.builtin.dnf:
+    name: "{{ splunk_uf_pkg_name }}"
+    state: latest
+  check_mode: true
+  register: splunk_uf_pending
+
+- name: Install or upgrade forwarder # noqa: no-handler
+  when: splunk_uf_pending is changed
+  block:
+
+    - name: Stop forwarder before the package transaction
+      ansible.builtin.systemd:
+        name: "{{ splunk_uf_service_name }}"
+        state: stopped
+      failed_when: false
+
+    - name: Install or upgrade forwarder package # noqa: package-latest
+      ansible.builtin.dnf:
+        name: "{{ splunk_uf_pkg_name }}"
+        state: latest
+
+- name: Check for the generated systemd unit
+  ansible.builtin.stat:
+    path: "/etc/systemd/system/{{ splunk_uf_service_name }}.service"
+  register: splunk_uf_unit
+
+- name: Enable boot-start under systemd
+  ansible.builtin.command:
+    cmd: >-
+      {{ splunk_uf_home }}/bin/splunk enable boot-start
+      -systemd-managed 1
+      -user {{ splunk_uf_user }}
+      -group {{ splunk_uf_group }}
+      --accept-license --answer-yes --no-prompt
+  changed_when: true
+  when: not splunk_uf_unit.stat.exists or splunk_uf_pending is changed
+
+- name: Ensure forwarder is enabled and running
+  ansible.builtin.systemd:
+    name: "{{ splunk_uf_service_name }}"
+    state: started
+    enabled: true
+    daemon_reload: true
