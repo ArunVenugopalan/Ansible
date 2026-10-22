@@ -1,0 +1,139 @@
+## 1. The guard
+
+`ansible/playbooks/_globals_check.yml`
+
+```yaml
+- name: Assert shared globals are loaded
+  ansible.builtin.assert:
+    that: _globals_loaded | default(false) | bool
+    fail_msg: >-
+      Shared globals not loaded. Run via the wrapper:
+        ansible/bin/ap <env> <playbook>
+      or pass both inventory sources:
+        -i ansible/inventories/global -i ansible/inventories/<env>
+    quiet: true
+```
+
+Add to **every play**:
+
+```yaml
+- name: Configure forwarders
+  hosts: splunk_forwarders
+  pre_tasks:
+    - name: Guard
+      ansible.builtin.import_tasks: _globals_check.yml
+      tags: [always]
+  roles:
+    - splunk_uf
+```
+
+`_globals_loaded: true` lives in `inventories/global/00-sentinel.yml`.
+
+**Why each piece:** the sentinel exists only in the global source, so its absence proves that source wasn't passed. `default(false)` stops the assert itself erroring on an undefined variable. `tags: [always]` is required — without it `--tags anything` skips the guard and every shared variable silently vanishes. `quiet: true` suppresses the per-host pass output.
+
+Per play, because `import_playbook` does not inherit `pre_tasks` — a `site.yml` importing six playbooks needs the block in each.
+
+## 2. `ansible/bin/ap`
+
+```python
+#!/usr/bin/env python3
+"""Run a playbook against one environment, with shared globals loaded.
+
+usage: ansible/bin/ap <env> <playbook> [ansible-playbook args...]
+"""
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]      # the ansible/ directory
+INV = ROOT / "inventories"
+GLOBAL = INV / "global"
+
+
+def main() -> None:
+    if len(sys.argv) < 3:
+        envs = sorted(p.name for p in INV.iterdir() if p.is_dir() and p != GLOBAL)
+        sys.exit(f"usage: ap <env> <playbook> [ansible-playbook args...]\n"
+                 f"environments: {' '.join(envs)}")
+
+    env, playbook, rest = sys.argv[1], sys.argv[2], sys.argv[3:]
+
+    if env == GLOBAL.name or not (INV / env).is_dir():
+        sys.exit(f"unknown environment: {env}")
+
+    pb = Path(playbook)
+    for cand in (pb, ROOT / playbook, ROOT / "playbooks" / playbook):
+        if cand.is_file():
+            pb = cand
+            break
+    else:
+        sys.exit(f"no such playbook: {playbook}")
+
+    # ANSIBLE_CONFIG rather than chdir: roles_path resolves against the cfg's
+    # own directory, so relative paths the user typed keep working.
+    os.environ["ANSIBLE_CONFIG"] = str(ROOT / "ansible.cfg")
+    # global FIRST so environment group_vars override it
+    os.environ["ANSIBLE_INVENTORY"] = f"{GLOBAL},{INV / env}"
+    # execvp replaces this process, so the TTY survives and
+    # --ask-vault-pass / --ask-become-pass prompt normally
+    os.execvp("ansible-playbook", ["ansible-playbook", str(pb), *rest])
+
+
+main()
+```
+
+## 3. `ansible/README.md`
+
+```markdown
+# Running playbooks
+
+Use the wrapper. It loads the shared globals plus one environment's inventory,
+in the right order.
+
+    ansible/bin/ap <env> <playbook> [any ansible-playbook args]
+
+    ansible/bin/ap                                   # list environments
+    ansible/bin/ap prod site.yml --ask-vault-pass
+    ansible/bin/ap prod site.yml --ask-vault-pass --check --diff
+    ansible/bin/ap prod site.yml --tags splunk_uf_config --limit idx01
+    ansible/bin/ap staging site.yml -e 'splunk_uf_version=9.3.2'
+
+Works from anywhere in the repo. The playbook can be a bare name
+(`site.yml`), an `ansible/`-relative path, or a path relative to your shell.
+All `ansible-playbook` flags pass straight through, including
+`--ask-vault-pass` and `--ask-become-pass`.
+
+## Without the wrapper
+
+Pass **both** inventory sources, global first:
+
+    ansible-playbook -i ansible/inventories/global \
+                     -i ansible/inventories/prod \
+                     ansible/playbooks/site.yml --ask-vault-pass
+
+Order matters. Reversed, the globals overwrite the environment's values.
+Pass only one and every play fails on the `_globals_check` guard.
+
+## Where variables live
+
+| Layer | Overridden by |
+|---|---|
+| `roles/<role>/defaults/` | everything — put tunables here |
+| `inventories/global/*.yml` | the environment below |
+| `inventories/<env>/group_vars/` | only `roles/<role>/vars/` and `-e` |
+| `roles/<role>/vars/` | only `-e` — hard constants only |
+
+Shared values in `inventories/global/` are **defaults**: any environment's
+`group_vars` wins. Jinja there is lazy, so
+`artifactory_pypi: "{{ artifactory_url }}/api/..."` picks up each
+environment's own `artifactory_url`.
+
+## Conventions
+
+- Vault files: `inventories/<env>/group_vars/all/vault.yml`. A filename
+  directly in `group_vars/` must match a group name or it is silently ignored.
+- Never create `playbooks/group_vars/` — it outranks the inventory and
+  shadows every environment.
+- Every new play needs the `pre_tasks` guard block; `import_playbook`
+  does not inherit it.
+```
