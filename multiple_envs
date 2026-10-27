@@ -33,6 +33,58 @@ Add to **every play**:
 
 Per play, because `import_playbook` does not inherit `pre_tasks` — a `site.yml` importing six playbooks needs the block in each.
 
+#!/usr/bin/env python3
+"""Run a playbook against one environment, with shared vars loaded.
+
+usage: ansible/bin/ap <env> <playbook> [ansible-playbook args...]
+"""
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]      # the ansible/ directory
+SHARED = ROOT / "shared_vars"
+INV = ROOT / "inventories"
+
+
+def environments() -> list[str]:
+    dirs = [p.name for p in INV.iterdir() if p.is_dir() and p.name != "group_vars"]
+    return sorted(dirs + [p.stem for p in INV.glob("*.yml")])
+
+
+def main() -> None:
+    if len(sys.argv) < 3:
+        sys.exit(f"usage: ap <env> <playbook> [ansible-playbook args...]\n"
+                 f"environments: {' '.join(environments())}")
+
+    env, playbook, rest = sys.argv[1], sys.argv[2], sys.argv[3:]
+
+    src = INV / env
+    if not src.is_dir():
+        src = INV / f"{env}.yml"
+    if not src.exists():
+        sys.exit(f"unknown environment: {env}\nenvironments: {' '.join(environments())}")
+    if not SHARED.is_dir():
+        sys.exit(f"missing shared vars directory: {SHARED}")
+
+    for cand in (Path(playbook), ROOT / playbook, ROOT / "playbooks" / playbook):
+        if cand.is_file():
+            pb = cand
+            break
+    else:
+        sys.exit(f"no such playbook: {playbook}")
+
+    argv = ["ansible-playbook", "-i", str(SHARED), "-i", str(src), str(pb), *rest]
+    child_env = {**os.environ, "ANSIBLE_CONFIG": str(ROOT / "ansible.cfg")}
+
+    print("+", " ".join(argv), file=sys.stderr)
+    os.execvpe(argv[0], argv, child_env)
+
+
+main()
+
+
+
 ## 2. `ansible/bin/ap`
 
 ```python
