@@ -33,6 +33,9 @@ Add to **every play**:
 
 Per play, because `import_playbook` does not inherit `pre_tasks` — a `site.yml` importing six playbooks needs the block in each.
 
+## 2. `ansible/bin/ap`
+
+```python
 #!/usr/bin/env python3
 """Run a playbook against one environment, with shared vars loaded.
 
@@ -79,56 +82,6 @@ def main() -> None:
 
     print("+", " ".join(argv), file=sys.stderr)
     os.execvpe(argv[0], argv, child_env)
-
-
-main()
-
-
-
-## 2. `ansible/bin/ap`
-
-```python
-#!/usr/bin/env python3
-"""Run a playbook against one environment, with shared globals loaded.
-
-usage: ansible/bin/ap <env> <playbook> [ansible-playbook args...]
-"""
-import os
-import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]      # the ansible/ directory
-INV = ROOT / "inventories"
-GLOBAL = INV / "global"
-
-
-def main() -> None:
-    if len(sys.argv) < 3:
-        envs = sorted(p.name for p in INV.iterdir() if p.is_dir() and p != GLOBAL)
-        sys.exit(f"usage: ap <env> <playbook> [ansible-playbook args...]\n"
-                 f"environments: {' '.join(envs)}")
-
-    env, playbook, rest = sys.argv[1], sys.argv[2], sys.argv[3:]
-
-    if env == GLOBAL.name or not (INV / env).is_dir():
-        sys.exit(f"unknown environment: {env}")
-
-    pb = Path(playbook)
-    for cand in (pb, ROOT / playbook, ROOT / "playbooks" / playbook):
-        if cand.is_file():
-            pb = cand
-            break
-    else:
-        sys.exit(f"no such playbook: {playbook}")
-
-    # ANSIBLE_CONFIG rather than chdir: roles_path resolves against the cfg's
-    # own directory, so relative paths the user typed keep working.
-    os.environ["ANSIBLE_CONFIG"] = str(ROOT / "ansible.cfg")
-    # global FIRST so environment group_vars override it
-    os.environ["ANSIBLE_INVENTORY"] = f"{GLOBAL},{INV / env}"
-    # execvp replaces this process, so the TTY survives and
-    # --ask-vault-pass / --ask-become-pass prompt normally
-    os.execvp("ansible-playbook", ["ansible-playbook", str(pb), *rest])
 
 
 main()
