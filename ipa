@@ -1,9 +1,30 @@
-Two patterns. The first is what you want for nearly everything.
+Role scaffolding, as asked. The structure is straightforward; the tag mechanics have one trap that will silently defeat the granularity, so that's flagged below the code.
 
-**Pattern A — ccache, no credentials in task args**
+**Tree**
+
+```
+ipa.yml
+vault/ipa-bootstrap.yml          # ansible-vault, outside group_vars/
+group_vars/ipaserver/main.yml
+roles/
+  freeipa_install/
+    defaults/main.yml
+    tasks/main.yml
+  freeipa_config/
+    defaults/main.yml
+    tasks/main.yml
+    tasks/groups.yml
+    tasks/rbac.yml
+    tasks/hbac.yml
+    tasks/sudo.yml
+    tasks/dns.yml
+```
+
+**ipa.yml**
 
 ```yaml
-- name: IPA config
+---
+- name: FreeIPA server
   hosts: ipaserver
   become: true
   gather_facts: false
@@ -15,75 +36,267 @@ Two patterns. The first is what you want for nearly everything.
       register: svc_ansible_kt
       tags: [always]
 
-    - name: Obtain TGT
+    - name: Fail early if realm not bootstrapped
+      ansible.builtin.assert:
+        that: svc_ansible_kt.stat.exists
+        fail_msg: >-
+          No keytab at {{ svc_ansible_keytab }}.
+          Run with --tags bootstrap first.
+      when: "'bootstrap' not in ansible_run_tags"
+      tags: [always]
+
+    - name: Obtain TGT as automation account
       ansible.builtin.command:
         cmd: kinit -kt {{ svc_ansible_keytab }} {{ svc_ansible_principal }}
       when: svc_ansible_kt.stat.exists
       changed_when: false
       tags: [always]
 
-  tasks:
-    - name: Ensure role groups present
-      freeipa.ansible_freeipa.ipagroup:
-        name: "{{ item }}"
-        description: "Service role group"
-      loop: "{{ ipa_role_groups }}"
+  roles:
+    - role: freeipa_install
+      tags: [never, bootstrap]
 
-    - name: Ensure jump host HBAC rule
-      freeipa.ansible_freeipa.ipahbacrule:
-        name: rdp-accounts-jumphosts
-        hostgroup:
-          - jumphosts
-        usergroup:
-          - rdp-accounts
-        hbacsvc:
-          - sshd
-        state: present
-
-    - name: Ensure sudo rule for platform admins
-      freeipa.ansible_freeipa.ipasudorule:
-        name: platform-admin-all
-        usergroup:
-          - role-platform-admin
-        hostgroup:
-          - swarm-nodes
-        cmdcategory: all
-        state: present
+    - role: freeipa_config
+      tags: [config, bootstrap]
 ```
 
-No `ipaadmin_*` anywhere. The modules find root's ccache because `become: true`.
-
-**Pattern B — explicit keytab per module**
-
-Only when you can't rely on the ccache — a one-off play, or something running outside your normal entry point.
+**roles/freeipa_install/defaults/main.yml**
 
 ```yaml
-- name: Ensure group present
-  freeipa.ansible_freeipa.ipagroup:
-    ipaadmin_principal: "{{ svc_ansible_principal }}"
-    ipaadmin_keytab: "{{ svc_ansible_keytab }}"
-    name: role-artifactory-admin
+---
+ipaserver_realm: SBOX.TEST
+ipaserver_domain: sbox.test
+ipa_bootstrap_vault: "{{ playbook_dir }}/vault/ipa-bootstrap.yml"
+
+ipa_automation_privileges:
+  - User Administrators
+  - Group Administrators
+  - Host Administrators
 ```
 
-Both parameters together — principal alone defaults to `admin` and the keytab lookup fails confusingly. The path resolves on the **node**, not the controller; that trips people who assume controller-side execution.
-
-To avoid repeating it across many tasks, `module_defaults` keyed per module works:
+**roles/freeipa_install/tasks/main.yml**
 
 ```yaml
-module_defaults:
+---
+- name: Load bootstrap credentials
+  ansible.builtin.include_vars:
+    file: "{{ ipa_bootstrap_vault }}"
+  no_log: true
+
+- name: Install IPA server
+  ansible.builtin.include_role:
+    name: freeipa.ansible_freeipa.ipaserver
+  vars:
+    ipaadmin_password: "{{ enc_ipa_admin_password }}"
+    ipadm_password: "{{ enc_ipa_dm_password }}"
+
+# KDC exists only after the install above
+- name: Obtain admin TGT
+  ansible.builtin.shell:
+    cmd: kinit admin
+    stdin: "{{ enc_ipa_admin_password }}"
+  no_log: true
+  changed_when: false
+
+- name: Ensure automation account exists
+  freeipa.ansible_freeipa.ipauser:
+    name: "{{ svc_ansible_principal }}"
+    first: Ansible
+    last: Automation
+
+- name: Ensure automation accounts group exists
   freeipa.ansible_freeipa.ipagroup:
-    ipaadmin_principal: "{{ svc_ansible_principal }}"
-    ipaadmin_keytab: "{{ svc_ansible_keytab }}"
+    name: automation-accounts
+    user:
+      - "{{ svc_ansible_principal }}"
+
+- name: Exempt automation accounts from password expiry
+  freeipa.ansible_freeipa.ipapwpolicy:
+    name: automation-accounts
+    priority: 1
+    maxpwdlife: 0
+
+- name: Ensure scoped automation role exists
+  freeipa.ansible_freeipa.iparole:
+    name: Ansible Automation
+    privilege: "{{ ipa_automation_privileges }}"
+    user:
+      - "{{ svc_ansible_principal }}"
+
+- name: Extract automation keytab
+  ansible.builtin.command:
+    cmd: >-
+      ipa-getkeytab -p {{ svc_ansible_principal }}
+      -k {{ svc_ansible_keytab }}
+    creates: "{{ svc_ansible_keytab }}"
+
+- name: Secure automation keytab
+  ansible.builtin.file:
+    path: "{{ svc_ansible_keytab }}"
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Switch to automation identity
+  ansible.builtin.command:
+    cmd: kinit -kt {{ svc_ansible_keytab }} {{ svc_ansible_principal }}
+  changed_when: false
+```
+
+**roles/freeipa_config/defaults/main.yml**
+
+```yaml
+---
+ipa_config_groups: true
+ipa_config_rbac: true
+ipa_config_hbac: true
+ipa_config_sudo: true
+ipa_config_dns: false
+
+# Lockout risk — leave false until hbactest passes
+ipa_disable_allow_all: false
+
+ipa_role_groups: []
+ipa_access_groups: []
+ipa_host_groups: []
+ipa_roles: []
+ipa_hbac_rules: []
+ipa_sudo_rules: []
+ipa_dns_zones: []
+ipa_dns_records: []
+```
+
+**roles/freeipa_config/tasks/main.yml**
+
+```yaml
+---
+- name: Groups
+  ansible.builtin.import_tasks: groups.yml
+  when: ipa_config_groups | bool
+  tags: [groups]
+
+- name: RBAC
+  ansible.builtin.import_tasks: rbac.yml
+  when: ipa_config_rbac | bool
+  tags: [rbac]
+
+- name: HBAC
+  ansible.builtin.import_tasks: hbac.yml
+  when: ipa_config_hbac | bool
+  tags: [hbac]
+
+- name: Sudo
+  ansible.builtin.import_tasks: sudo.yml
+  when: ipa_config_sudo | bool
+  tags: [sudo]
+
+- name: DNS
+  ansible.builtin.import_tasks: dns.yml
+  when: ipa_config_dns | bool
+  tags: [dns]
+```
+
+**tasks/groups.yml**
+
+```yaml
+---
+- name: Ensure service role groups present
+  freeipa.ansible_freeipa.ipagroup:
+    name: "{{ item }}"
+  loop: "{{ ipa_role_groups }}"
+
+- name: Ensure access class groups present
+  freeipa.ansible_freeipa.ipagroup:
+    name: "{{ item }}"
+  loop: "{{ ipa_access_groups }}"
+
+- name: Ensure host groups present
+  freeipa.ansible_freeipa.ipahostgroup:
+    name: "{{ item }}"
+  loop: "{{ ipa_host_groups }}"
+```
+
+**tasks/rbac.yml**
+
+```yaml
+---
+- name: Ensure IPA roles present
+  freeipa.ansible_freeipa.iparole:
+    name: "{{ item.name }}"
+    privilege: "{{ item.privilege }}"
+    group: "{{ item.group | default(omit) }}"
+    user: "{{ item.user | default(omit) }}"
+    state: present
+  loop: "{{ ipa_roles }}"
+  loop_control:
+    label: "{{ item.name }}"
+```
+
+**tasks/hbac.yml**
+
+```yaml
+---
+- name: Ensure HBAC rules present
   freeipa.ansible_freeipa.ipahbacrule:
-    ipaadmin_principal: "{{ svc_ansible_principal }}"
-    ipaadmin_keytab: "{{ svc_ansible_keytab }}"
+    name: "{{ item.name }}"
+    usergroup: "{{ item.usergroup | default(omit) }}"
+    hostgroup: "{{ item.hostgroup | default(omit) }}"
+    hbacsvc: "{{ item.hbacsvc | default(['sshd']) }}"
+    state: present
+  loop: "{{ ipa_hbac_rules }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Disable allow_all HBAC rule
+  freeipa.ansible_freeipa.ipahbacrule:
+    name: allow_all
+    state: disabled
+  when: ipa_disable_allow_all | bool
 ```
 
-Verbose enough that Pattern A is usually the better answer.
+**tasks/sudo.yml**
+
+```yaml
+---
+- name: Ensure sudo rules present
+  freeipa.ansible_freeipa.ipasudorule:
+    name: "{{ item.name }}"
+    usergroup: "{{ item.usergroup | default(omit) }}"
+    hostgroup: "{{ item.hostgroup | default(omit) }}"
+    cmdcategory: "{{ item.cmdcategory | default(omit) }}"
+    sudocmd: "{{ item.sudocmd | default(omit) }}"
+    state: present
+  loop: "{{ ipa_sudo_rules }}"
+  loop_control:
+    label: "{{ item.name }}"
+```
+
+**tasks/dns.yml**
+
+```yaml
+---
+- name: Ensure DNS zones present
+  freeipa.ansible_freeipa.ipadnszone:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ ipa_dns_zones }}"
+
+- name: Ensure DNS records present
+  freeipa.ansible_freeipa.ipadnsrecord:
+    zone_name: "{{ item.zone }}"
+    name: "{{ item.name }}"
+    record_type: "{{ item.type }}"
+    record_value: "{{ item.value }}"
+    state: present
+  loop: "{{ ipa_dns_records }}"
+  loop_control:
+    label: "{{ item.name }}.{{ item.zone }}"
+```
 
 **group_vars/ipaserver/main.yml**
 
 ```yaml
+---
 svc_ansible_principal: svc-ansible
 svc_ansible_keytab: /etc/ipa/svc-ansible.keytab
 
@@ -92,8 +305,57 @@ ipa_role_groups:
   - role-artifactory-read
   - role-grafana-admin
   - role-grafana-read
+
+ipa_access_groups:
+  - rdp-accounts
+  - dev-accounts
+
+ipa_host_groups:
+  - jumphosts
+  - dev-workstations
+  - swarm-nodes
+
+ipa_hbac_rules:
+  - name: rdp-accounts-jumphosts
+    usergroup: [rdp-accounts]
+    hostgroup: [jumphosts]
+  - name: dev-accounts-workstations
+    usergroup: [dev-accounts]
+    hostgroup: [dev-workstations]
+
+ipa_sudo_rules:
+  - name: platform-admin-all
+    usergroup: [role-platform-admin]
+    hostgroup: [swarm-nodes]
+    cmdcategory: all
 ```
 
-**One behaviour worth knowing before you trust `--check`**
+---
 
-ansible-freeipa modules talk to the IPA API rather than managing local state, and check-mode support varies by module and version. Run `--check` against sbox first and confirm it reports what you expect — don't assume a clean dry run means a clean apply.
+**The trap: `import_tasks`, not `include_tasks`**
+
+`import_tasks` is static, so the `tags: [hbac]` on the import propagates to every task inside `hbac.yml`. `include_tasks` is dynamic — the tag gates only whether the include *runs*, and inner tasks inherit nothing, so `--tags hbac` would execute the include and then skip everything it contains. Silent no-op, no error.
+
+If you ever need a dynamic include here (a loop over an undefined-at-parse-time list), it has to be `include_tasks` with an explicit `apply: { tags: [hbac] }`.
+
+**Var vs tag — they're for different things**
+
+- **Vars** are the standing shape of the environment. `ipa_config_dns: false` because this realm doesn't serve DNS. Set per environment in group_vars, rarely changes.
+- **Tags** are this invocation. `--tags hbac` because you just edited an HBAC rule and don't want to walk the whole realm.
+
+Both gates must pass, so `--tags dns` does nothing while `ipa_config_dns: false` — intentional, but it reads as a mysterious no-op the first time. Worth knowing before you debug it.
+
+**Running**
+
+```bash
+ansible-playbook ipa.yml --tags bootstrap    # install + full config
+ansible-playbook ipa.yml                     # full config
+ansible-playbook ipa.yml --tags hbac         # HBAC only
+ansible-playbook ipa.yml --tags hbac,sudo    # both
+```
+
+Verify the wiring once with `--list-tasks` on each of those before trusting it — particularly `--tags hbac`, which is the one that proves the import tag propagation works.
+
+**Unchanged caveats**
+
+`allow_all` stays enabled until `ipa hbactest --user=<your-rdp-account> --host=<jumphost> --service=sshd` passes. `ipa_dns_zones` defaults empty and `ipa_config_dns: false` because you hadn't settled delegation vs. forwarding — if the corporate resolvers forward to IPA, that stays false permanently.
