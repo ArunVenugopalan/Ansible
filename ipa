@@ -1,0 +1,99 @@
+Two patterns. The first is what you want for nearly everything.
+
+**Pattern A — ccache, no credentials in task args**
+
+```yaml
+- name: IPA config
+  hosts: ipaserver
+  become: true
+  gather_facts: false
+
+  pre_tasks:
+    - name: Check for automation keytab
+      ansible.builtin.stat:
+        path: "{{ svc_ansible_keytab }}"
+      register: svc_ansible_kt
+      tags: [always]
+
+    - name: Obtain TGT
+      ansible.builtin.command:
+        cmd: kinit -kt {{ svc_ansible_keytab }} {{ svc_ansible_principal }}
+      when: svc_ansible_kt.stat.exists
+      changed_when: false
+      tags: [always]
+
+  tasks:
+    - name: Ensure role groups present
+      freeipa.ansible_freeipa.ipagroup:
+        name: "{{ item }}"
+        description: "Service role group"
+      loop: "{{ ipa_role_groups }}"
+
+    - name: Ensure jump host HBAC rule
+      freeipa.ansible_freeipa.ipahbacrule:
+        name: rdp-accounts-jumphosts
+        hostgroup:
+          - jumphosts
+        usergroup:
+          - rdp-accounts
+        hbacsvc:
+          - sshd
+        state: present
+
+    - name: Ensure sudo rule for platform admins
+      freeipa.ansible_freeipa.ipasudorule:
+        name: platform-admin-all
+        usergroup:
+          - role-platform-admin
+        hostgroup:
+          - swarm-nodes
+        cmdcategory: all
+        state: present
+```
+
+No `ipaadmin_*` anywhere. The modules find root's ccache because `become: true`.
+
+**Pattern B — explicit keytab per module**
+
+Only when you can't rely on the ccache — a one-off play, or something running outside your normal entry point.
+
+```yaml
+- name: Ensure group present
+  freeipa.ansible_freeipa.ipagroup:
+    ipaadmin_principal: "{{ svc_ansible_principal }}"
+    ipaadmin_keytab: "{{ svc_ansible_keytab }}"
+    name: role-artifactory-admin
+```
+
+Both parameters together — principal alone defaults to `admin` and the keytab lookup fails confusingly. The path resolves on the **node**, not the controller; that trips people who assume controller-side execution.
+
+To avoid repeating it across many tasks, `module_defaults` keyed per module works:
+
+```yaml
+module_defaults:
+  freeipa.ansible_freeipa.ipagroup:
+    ipaadmin_principal: "{{ svc_ansible_principal }}"
+    ipaadmin_keytab: "{{ svc_ansible_keytab }}"
+  freeipa.ansible_freeipa.ipahbacrule:
+    ipaadmin_principal: "{{ svc_ansible_principal }}"
+    ipaadmin_keytab: "{{ svc_ansible_keytab }}"
+```
+
+Verbose enough that Pattern A is usually the better answer.
+
+**group_vars/ipaserver/main.yml**
+
+```yaml
+svc_ansible_principal: svc-ansible
+svc_ansible_keytab: /etc/ipa/svc-ansible.keytab
+
+ipa_role_groups:
+  - role-artifactory-admin
+  - role-artifactory-read
+  - role-grafana-admin
+  - role-grafana-read
+```
+
+**One behaviour worth knowing before you trust `--check`**
+
+ansible-freeipa modules talk to the IPA API rather than managing local state, and check-mode support varies by module and version. Run `--check` against sbox first and confirm it reports what you expect — don't assume a clean dry run means a clean apply.
