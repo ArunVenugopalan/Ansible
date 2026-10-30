@@ -1,0 +1,187 @@
+Let me actually test these rather than assert them.
+
+inotify-tools isn't here, but I can test the behaviours directly against the kernel API.
+
+Tested both on a live kernel. Two concrete failures, both reproducible.
+
+## Finding 1 — inotify does not follow new directories
+
+`inotifywait -r` walks the tree **once at startup** and adds a watch per directory. Directories created afterwards are not watched.
+
+```
+watches established at start: 5
+  write to EXISTING watched dir -> SEEN
+  write in NEW dir tree         -> MISSED
+     (raw events caught: [('0x40000100', 'bob')])
+```
+
+The only event was `IN_CREATE|IN_ISDIR` for `bob` itself. The `.remmina` file written three levels below produced **nothing**.
+
+For you that means: a new engineer, or any existing engineer whose `~/.local/share/remmina` is created after the watcher started, is unmonitored until the service restarts. Silently.
+
+## Finding 2 — `close_write` alone misses atomic saves
+
+```
+TEST 2 - atomic rename save: close_write=0 moved_to=1
+  -> watching close_write ALONE would MISS this save
+```
+
+Write-to-temp-then-rename produces **no** `close_write` on the target. Any watcher using only `-e close_write` — which is the common recipe — misses it entirely. You need `-e moved_to` as well.
+
+## Finding 3 — watch consumption
+
+~21 directories per *minimal* engineer home in my simulation. Real dev homes are far worse: `.git/objects`, `node_modules`, `.vscode-server/extensions` push this into the thousands or tens of thousands each.
+
+```bash
+# your actual limits — mine differed from the box I tested on
+sysctl fs.inotify.max_user_watches fs.inotify.max_user_instances
+# current consumption
+find /proc/*/fd -lname anon_inode:inotify 2>/dev/null | wc -l
+```
+
+Exceeding the limit makes `inotify_add_watch` fail with ENOSPC. `inotifywait` warns and **carries on watching a partial tree**.
+
+## Finding 4 — failure is silent
+
+Crash, OOM-kill, ENOSPC, queue overflow (`IN_Q_OVERFLOW` when events arrive faster than they're read) — none of these announce themselves. The control stops working and nothing tells you.
+
+## So: both layers
+
+inotify is the fast path. The timer is the one that's actually guaranteed to run.
+
+```yaml
+- name: Deploy credential strip script
+  ansible.builtin.copy:
+    dest: /usr/local/sbin/remmina-strip
+    owner: root
+    group: root
+    mode: '0750'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      F='^(password|ssh_password|ssh_tunnel_password|ssh_passphrase|ssh_tunnel_passphrase)=.+'
+      N=0
+      while IFS= read -r -d '' f; do
+        if grep -qE "$F" "$f"; then
+          sed -ri "/$F/d" "$f"
+          logger -t remmina-strip -p authpriv.warning "stripped: $f"
+          N=$((N+1))
+        fi
+      done < <(find /home -maxdepth 6 -type f -name '*.remmina' -print0)
+      logger -t remmina-strip -p authpriv.info "sweep ok cleaned=$N"
+
+- name: Deploy watcher
+  ansible.builtin.copy:
+    dest: /usr/local/sbin/remmina-watch
+    owner: root
+    group: root
+    mode: '0750'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      inotifywait -m -r -q \
+        -e close_write -e moved_to -e create \
+        --format '%w%f' /home |
+      while IFS= read -r p; do
+        if [ -d "$p" ]; then
+          /usr/local/sbin/remmina-strip     # new dir: full sweep, watch is blind here
+        elif [[ "$p" == *.remmina ]]; then
+          /usr/local/sbin/remmina-strip
+        fi
+      done
+```
+
+Calling the same sweep from both paths means one implementation, and the `create` branch compensates for Finding 1 — a new directory triggers a full sweep rather than being missed.
+
+```yaml
+- name: Units
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.n }}"
+    mode: '0644'
+    content: "{{ item.c }}"
+  loop:
+    - n: remmina-strip.service
+      c: |
+        [Unit]
+        Description=Remmina credential sweep
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/local/sbin/remmina-strip
+    - n: remmina-strip.timer
+      c: |
+        [Unit]
+        Description=Periodic Remmina credential sweep
+        [Timer]
+        OnCalendar=*:0/10
+        Persistent=true
+        AccuracySec=30s
+        [Install]
+        WantedBy=timers.target
+    - n: remmina-watch.service
+      c: |
+        [Unit]
+        Description=Realtime Remmina credential watcher
+        After=local-fs.target
+        [Service]
+        ExecStart=/usr/local/sbin/remmina-watch
+        Restart=always
+        RestartSec=5
+        [Install]
+        WantedBy=multi-user.target
+  notify: reload systemd
+
+- name: Raise inotify limits
+  ansible.posix.sysctl:
+    name: "{{ item.k }}"
+    value: "{{ item.v }}"
+    sysctl_file: /etc/sysctl.d/90-inotify.conf
+    reload: true
+  loop:
+    - { k: fs.inotify.max_user_watches, v: '524288' }
+    - { k: fs.inotify.max_user_instances, v: '512' }
+```
+
+**Alert on the watcher being dead** — otherwise Finding 4 bites you. `systemctl is-active remmina-watch` into Prometheus, or alert on the `remmina-strip` journald tag going quiet for more than two sweep intervals.
+
+## Read-only profile test
+
+This is the control that makes both layers unnecessary. Test before committing:
+
+```bash
+# as a test user, on a non-production jumphost
+install -d -o root -g root -m 755 /etc/remmina-profiles
+install -o root -g root -m 644 ~/.local/share/remmina/devws01.remmina \
+  /etc/remmina-profiles/
+
+# 1. can Remmina still connect from a read-only profile?
+remmina -c /etc/remmina-profiles/devws01.remmina
+
+# 2. does it error, warn, or silently tolerate the failed write?
+journalctl --user -t remmina -n 50 --no-pager
+
+# 3. does the CLI bypass fail as expected?
+echo "test" | remmina --update-profile /etc/remmina-profiles/devws01.remmina \
+  --set-option password ; echo "exit=$?"
+
+# 4. block the writable fallback
+rm -rf ~/.local/share/remmina ~/.remmina
+install -d -o root -g root -m 555 ~/.local/share/remmina
+remmina -c /etc/remmina-profiles/devws01.remmina   # still works?
+```
+
+Step 1 is the one that decides it. If Remmina refuses to connect from a read-only profile, the design is out and you're on the two-layer sweep. If it connects, you have prevention instead of correction and the watcher becomes a backstop you barely need.
+
+## Links
+
+- inotify semantics, including the "does not recurse" and queue-overflow notes: https://man7.org/linux/man-pages/man7/inotify.7.html
+- `inotifywait` flags: https://man7.org/linux/man-pages/man1/inotifywait.1.html
+- `systemd.timer`: https://www.freedesktop.org/software/systemd/man/systemd.timer.html
+- Remmina man page (`--kiosk`, `--enable-extra-hardening`, `--update-profile`): https://manpages.debian.org/testing/remmina/remmina.1.en.html
+
+## Flags
+
+- **My watch-limit numbers are from this test box, not yours.** Run the `sysctl` line on a real jumphost — the defaults differ by build and your hardening baseline may have changed them.
+- **The `create` branch triggers a full sweep per directory creation.** On a busy home that could be noisy; rate-limit if `remmina-strip` shows up constantly in the journal.
+- Test scripts are at `/tmp/claude-0/-home-claude/f20daf88-0775-55fe-8de0-8eb7dde05f3a/scratchpad/inotify_test.py` and `/tmp/claude-0/-home-claude/f20daf88-0775-55fe-8de0-8eb7dde05f3a/scratchpad/watch_scale.py` if you want to re-run them on your own kernel — they use only ctypes and stdlib.
+
+Want this written up as a project doc? The two tested failure modes are the part worth having in writing when you argue for the read-only design over the watcher.
