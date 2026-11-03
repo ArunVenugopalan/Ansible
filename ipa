@@ -1,9 +1,3 @@
-Before the code — the flaw in "+1 year on every bootstrap":
-
-Bootstrap runs once per realm. A stamp set only there is a one-year timer with nothing to renew it, which is the failure you just hit, deferred. And it can't self-renew from the config path: modifying `krbPasswordExpiration` needs admin-level write on that attribute, so svc-ansible can't push out its own expiry.
-
-So the persistent fix is the password policy. The +1y stamp goes in anyway — it clears any expiry already stamped on the entry before the policy existed, which a policy change won't do retroactively.
-
 **ipa.yml**
 
 ```yaml
@@ -46,14 +40,6 @@ So the persistent fix is the password policy. The +1y stamp goes in anyway — i
 ipaserver_realm: SBOX.TEST
 ipaserver_domain: sbox.test
 ipa_bootstrap_vault: "{{ playbook_dir }}/vault/ipa-bootstrap.yml"
-
-ipa_automation_privileges:
-  - User Administrators
-  - Group Administrators
-  - Host Administrators
-
-ipa_automation_ticket_life: 3600
-ipa_automation_expiry_extend: "+1 year"
 ```
 
 **roles/freeipa_install/tasks/main.yml**
@@ -85,68 +71,29 @@ ipa_automation_expiry_extend: "+1 year"
     name: "{{ svc_ansible_principal }}"
     first: Ansible
     last: Automation
+    password: "{{ enc_svc_ansible_password }}"
+  no_log: true
 
-- name: Ensure automation accounts group exists
-  freeipa.ansible_freeipa.ipagroup:
-    name: automation-accounts
-    user:
-      - "{{ svc_ansible_principal }}"
-
-# Persistent fix — stops any future expiry being stamped
-- name: Exempt automation accounts from password expiry
-  freeipa.ansible_freeipa.ipapwpolicy:
-    name: automation-accounts
-    priority: 1
-    maxpwdlife: 0
-
-# Clears an expiry already on the entry; policy change is not retroactive
-- name: Push password expiry out
-  ansible.builtin.shell:
+# Clears the admin-set-password forced reset; must follow the task above
+- name: Clear password expiry on automation account
+  ansible.builtin.command:
     cmd: >-
       ipa user-mod {{ svc_ansible_principal }}
-      --setattr krbPasswordExpiration=$(date -u -d '{{ ipa_automation_expiry_extend }}' +%Y%m%d%H%M%SZ)
+      --setattr krbPasswordExpiration=20380119031407Z
   changed_when: true
 
-- name: Ensure scoped automation role exists
-  freeipa.ansible_freeipa.iparole:
-    name: Ansible Automation
-    privilege: "{{ ipa_automation_privileges }}"
+- name: Add automation account to admins
+  freeipa.ansible_freeipa.ipagroup:
+    name: admins
     user:
       - "{{ svc_ansible_principal }}"
-
-- name: Ensure automation keytab directory exists
-  ansible.builtin.file:
-    path: "{{ svc_ansible_keytab | dirname }}"
-    state: directory
-    owner: root
-    group: root
-    mode: "0700"
-
-- name: Extract automation keytab
-  ansible.builtin.command:
-    cmd: >-
-      ipa-getkeytab -p {{ svc_ansible_principal }}
-      -k {{ svc_ansible_keytab }}
-    creates: "{{ svc_ansible_keytab }}"
-
-- name: Secure automation keytab
-  ansible.builtin.file:
-    path: "{{ svc_ansible_keytab }}"
-    owner: root
-    group: root
-    mode: "0600"
-
-- name: Limit ticket lifetime for automation account
-  ansible.builtin.command:
-    cmd: >-
-      ipa krbtpolicy-mod {{ svc_ansible_principal }}
-      --maxlife={{ ipa_automation_ticket_life }}
-      --maxrenew={{ ipa_automation_ticket_life }}
-  changed_when: true
+    action: member
 
 - name: Switch to automation identity
-  ansible.builtin.command:
-    cmd: kinit -kt {{ svc_ansible_keytab }} {{ svc_ansible_principal }}
+  ansible.builtin.shell:
+    cmd: kinit {{ svc_ansible_principal }}
+    stdin: "{{ enc_svc_ansible_password }}"
+  no_log: true
   changed_when: false
 ```
 
@@ -200,21 +147,11 @@ ipa_disable_allow_all: false
 
 ```yaml
 ---
-- name: Check for automation keytab
-  ansible.builtin.stat:
-    path: "{{ svc_ansible_keytab }}"
-  register: svc_ansible_kt
-
-- name: Fail if realm not bootstrapped
-  ansible.builtin.assert:
-    that: svc_ansible_kt.stat.exists
-    fail_msg: >-
-      No keytab at {{ svc_ansible_keytab }}.
-      Run with --tags bootstrap first.
-
-- name: Obtain TGT from keytab
-  ansible.builtin.command:
-    cmd: kinit -kt {{ svc_ansible_keytab }} {{ svc_ansible_principal }}
+- name: Obtain TGT
+  ansible.builtin.shell:
+    cmd: kinit {{ svc_ansible_principal }}
+    stdin: "{{ enc_svc_ansible_password }}"
+  no_log: true
   changed_when: false
 ```
 
@@ -248,7 +185,6 @@ ipa_disable_allow_all: false
     privilege: "{{ item.privilege }}"
     group: "{{ item.group | default(omit) }}"
     user: "{{ item.user | default(omit) }}"
-    service: "{{ item.service | default(omit) }}"
     state: present
   loop: "{{ ipa_roles }}"
   loop_control:
@@ -321,7 +257,6 @@ ipa_disable_allow_all: false
 ```yaml
 ---
 svc_ansible_principal: svc-ansible
-svc_ansible_keytab: /var/lib/ipa-automation/svc-ansible.keytab
 
 ipa_role_groups:
   - role-artifactory-admin
@@ -353,7 +288,14 @@ ipa_sudo_rules:
     cmdcategory: all
 ```
 
-**vault/ipa-bootstrap.yml** — `ansible-vault encrypt`, outside `group_vars/`
+**group_vars/ipaserver/vault.yml** — `ansible-vault encrypt`
+
+```yaml
+---
+enc_svc_ansible_password: "..."
+```
+
+**vault/ipa-bootstrap.yml** — `ansible-vault encrypt`, keep outside `group_vars/`
 
 ```yaml
 ---
@@ -361,35 +303,30 @@ enc_ipa_admin_password: "..."
 enc_ipa_dm_password: "..."
 ```
 
+**inventory.ini**
+
+```ini
+[ipaserver]
+ipa.sbox.test
+```
+
 ---
 
-**Running**
+**Run**
 
 ```bash
-ansible-playbook ipa.yml --tags bootstrap     # install + full config
-ansible-playbook ipa.yml                      # full config, keytab auth
-ansible-playbook ipa.yml --tags hbac          # HBAC only
+ansible-galaxy collection install freeipa.ansible_freeipa
+
+ansible-playbook -i inventory.ini ipa.yml --tags bootstrap --ask-vault-pass
+ansible-playbook -i inventory.ini ipa.yml --ask-vault-pass
+ansible-playbook -i inventory.ini ipa.yml --tags hbac --ask-vault-pass
 ```
 
-No vault password needed on routine runs — that's what the keytab buys you.
-
-**Verify the expiry actually took**
+**Check after bootstrap**
 
 ```bash
-ipa user-show svc-ansible --all | grep -i expiration
-ipa pwpolicy-show automation-accounts
+ipa user-show svc-ansible --all | grep -i expiration   # expect 20380119031407Z
+ipa group-show admins                                   # expect admin and svc-ansible
 ```
 
-If a date is still stamped after bootstrap, the `--setattr` didn't apply and you want to know now. `20380119031407Z` is the never-expires sentinel, not a real deadline.
-
-**The change that deletes this problem**
-
-A **service principal** has no password, no password policy, and no `krbPasswordExpiration` — the whole expiry class disappears. IPA roles accept services as members, and the `iparole` module takes a `service` parameter (already wired above).
-
-```bash
-ipa service-add ansible/ipa.sbox.test
-ipa role-add-member "Ansible Automation" --services=ansible/ipa.sbox.test
-ipa-getkeytab -p ansible/ipa.sbox.test -k /var/lib/ipa-automation/svc-ansible.keytab
-```
-
-That removes the pwpolicy task, the `--setattr` task and the automation-accounts group. It costs a re-bootstrap since the principal name changes — cheap in sbox, not later. Worth deciding before this realm becomes the template for the real one.
+Two things not to change without thinking: `action: member` on the admins task (without it the module manages the whole member list and can remove `admin`), and the order of the `ipauser` and `--setattr` tasks (the password set re-triggers forced expiry each bootstrap; the setattr clears it).
