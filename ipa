@@ -1,3 +1,5 @@
+Keytab-only, single account, vault needed on bootstrap runs only.
+
 **ipa.yml**
 
 ```yaml
@@ -6,9 +8,6 @@
   hosts: ipaserver
   become: true
   gather_facts: false
-
-  environment:
-    KRB5CCNAME: "FILE:/tmp/krb5cc_ansible_ipa"
 
   pre_tasks:
     - name: Ensure Kerberos Python bindings present
@@ -20,14 +19,18 @@
   roles:
     - role: freeipa_install
       tags: [never, bootstrap]
+      environment:
+        KRB5CCNAME: "{{ ipa_ccache }}"
 
     - role: freeipa_config
       tags: [config, bootstrap]
+      environment:
+        KRB5CCNAME: "{{ ipa_ccache }}"
 
   post_tasks:
     - name: Destroy credential cache
       ansible.builtin.command:
-        cmd: kdestroy -c FILE:/tmp/krb5cc_ansible_ipa
+        cmd: kdestroy -c {{ ipa_ccache }}
       changed_when: false
       failed_when: false
       tags: [always]
@@ -40,6 +43,9 @@
 ipaserver_realm: SBOX.TEST
 ipaserver_domain: sbox.test
 ipa_bootstrap_vault: "{{ playbook_dir }}/vault/ipa-bootstrap.yml"
+
+# true: repair stale keytab automatically. Set false in prod so drift surfaces.
+svc_ansible_rekey_on_drift: true
 ```
 
 **roles/freeipa_install/tasks/main.yml**
@@ -71,10 +77,7 @@ ipa_bootstrap_vault: "{{ playbook_dir }}/vault/ipa-bootstrap.yml"
     name: "{{ svc_ansible_principal }}"
     first: Ansible
     last: Automation
-    password: "{{ enc_svc_ansible_password }}"
-  no_log: true
 
-# Clears the admin-set-password forced reset; must follow the task above
 - name: Clear password expiry on automation account
   ansible.builtin.command:
     cmd: >-
@@ -89,11 +92,68 @@ ipa_bootstrap_vault: "{{ playbook_dir }}/vault/ipa-bootstrap.yml"
       - "{{ svc_ansible_principal }}"
     action: member
 
+- name: Ensure automation keytab directory exists
+  ansible.builtin.file:
+    path: "{{ svc_ansible_keytab | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+# Own ccache, or this clobbers the admin TGT obtained above
+- name: Test existing automation keytab
+  ansible.builtin.command:
+    cmd: kinit -kt {{ svc_ansible_keytab }} {{ svc_ansible_principal }}
+  environment:
+    KRB5CCNAME: "FILE:/tmp/krb5cc_keytab_probe"
+  register: svc_ansible_kt_test
+  failed_when: false
+  changed_when: false
+
+- name: Discard probe cache
+  ansible.builtin.command:
+    cmd: kdestroy -c FILE:/tmp/krb5cc_keytab_probe
+  changed_when: false
+  failed_when: false
+
+- name: Fail on unexpected keytab drift
+  ansible.builtin.fail:
+    msg: >-
+      Keytab at {{ svc_ansible_keytab }} no longer authenticates.
+      Something re-keyed {{ svc_ansible_principal }}.
+      Check the 389-DS access log, then re-run with
+      -e svc_ansible_rekey_on_drift=true once understood.
+  when:
+    - svc_ansible_kt_test.rc != 0
+    - not svc_ansible_rekey_on_drift | bool
+
+- name: Re-key automation account
+  when:
+    - svc_ansible_kt_test.rc != 0
+    - svc_ansible_rekey_on_drift | bool
+  block:
+    - name: Remove stale keytab
+      ansible.builtin.file:
+        path: "{{ svc_ansible_keytab }}"
+        state: absent
+
+    - name: Extract automation keytab
+      ansible.builtin.command:
+        cmd: >-
+          ipa-getkeytab -p {{ svc_ansible_principal }}
+          -k {{ svc_ansible_keytab }}
+      changed_when: true
+
+    - name: Secure automation keytab
+      ansible.builtin.file:
+        path: "{{ svc_ansible_keytab }}"
+        owner: root
+        group: root
+        mode: "0600"
+
 - name: Switch to automation identity
-  ansible.builtin.shell:
-    cmd: kinit {{ svc_ansible_principal }}
-    stdin: "{{ enc_svc_ansible_password }}"
-  no_log: true
+  ansible.builtin.command:
+    cmd: kinit -kt {{ svc_ansible_keytab }} {{ svc_ansible_principal }}
   changed_when: false
 ```
 
@@ -101,7 +161,7 @@ ipa_bootstrap_vault: "{{ playbook_dir }}/vault/ipa-bootstrap.yml"
 
 ```yaml
 ---
-ipa_role_groups: []
+ipa_app_groups: []
 ipa_access_groups: []
 ipa_host_groups: []
 ipa_roles: []
@@ -147,11 +207,21 @@ ipa_disable_allow_all: false
 
 ```yaml
 ---
-- name: Obtain TGT
-  ansible.builtin.shell:
-    cmd: kinit {{ svc_ansible_principal }}
-    stdin: "{{ enc_svc_ansible_password }}"
-  no_log: true
+- name: Check for automation keytab
+  ansible.builtin.stat:
+    path: "{{ svc_ansible_keytab }}"
+  register: svc_ansible_kt
+
+- name: Fail if realm not bootstrapped
+  ansible.builtin.assert:
+    that: svc_ansible_kt.stat.exists
+    fail_msg: >-
+      No keytab at {{ svc_ansible_keytab }}.
+      Run with --tags bootstrap first.
+
+- name: Obtain TGT from keytab
+  ansible.builtin.command:
+    cmd: kinit -kt {{ svc_ansible_keytab }} {{ svc_ansible_principal }}
   changed_when: false
 ```
 
@@ -159,10 +229,10 @@ ipa_disable_allow_all: false
 
 ```yaml
 ---
-- name: Ensure service role groups present
+- name: Ensure application groups present
   freeipa.ansible_freeipa.ipagroup:
     name: "{{ item }}"
-  loop: "{{ ipa_role_groups }}"
+  loop: "{{ ipa_app_groups }}"
 
 - name: Ensure access class groups present
   freeipa.ansible_freeipa.ipagroup:
@@ -185,6 +255,7 @@ ipa_disable_allow_all: false
     privilege: "{{ item.privilege }}"
     group: "{{ item.group | default(omit) }}"
     user: "{{ item.user | default(omit) }}"
+    service: "{{ item.service | default(omit) }}"
     state: present
   loop: "{{ ipa_roles }}"
   loop_control:
@@ -256,20 +327,27 @@ ipa_disable_allow_all: false
 
 ```yaml
 ---
-svc_ansible_principal: svc-ansible
+svc_ansible_principal: svc-ansible-kt      # your keytab account name
+svc_ansible_keytab: /var/lib/ipa-automation/svc-ansible.keytab
+ipa_ccache: "FILE:/tmp/krb5cc_ansible_kt"
 
-ipa_role_groups:
-  - role-artifactory-admin
-  - role-artifactory-read
-  - role-grafana-admin
-  - role-grafana-read
+ipa_app_groups:
+  - gitlab-platform-maintainer
+  - gitlab-platform-developer
+  - gitlab-instance-admin
+  - grafana-admin
+  - grafana-viewer
+  - artifactory-admin
+  - artifactory-read
 
 ipa_access_groups:
   - rdp-accounts
   - dev-accounts
+  - admin-accounts
 
 ipa_host_groups:
   - jumphosts
+  - adminjumphosts
   - dev-workstations
   - swarm-nodes
 
@@ -280,22 +358,18 @@ ipa_hbac_rules:
   - name: dev-accounts-workstations
     usergroup: [dev-accounts]
     hostgroup: [dev-workstations]
+  - name: admin-accounts-adminjumphosts
+    usergroup: [admin-accounts]
+    hostgroup: [adminjumphosts]
 
 ipa_sudo_rules:
   - name: platform-admin-all
-    usergroup: [role-platform-admin]
+    usergroup: [admin-accounts]
     hostgroup: [swarm-nodes]
     cmdcategory: all
 ```
 
-**group_vars/ipaserver/vault.yml** — `ansible-vault encrypt`
-
-```yaml
----
-enc_svc_ansible_password: "..."
-```
-
-**vault/ipa-bootstrap.yml** — `ansible-vault encrypt`, keep outside `group_vars/`
+**vault/ipa-bootstrap.yml** — `ansible-vault encrypt`, outside `group_vars/`
 
 ```yaml
 ---
@@ -303,30 +377,37 @@ enc_ipa_admin_password: "..."
 enc_ipa_dm_password: "..."
 ```
 
-**inventory.ini**
-
-```ini
-[ipaserver]
-ipa.sbox.test
-```
-
 ---
 
-**Run**
+**Running**
 
 ```bash
-ansible-galaxy collection install freeipa.ansible_freeipa
-
-ansible-playbook -i inventory.ini ipa.yml --tags bootstrap --ask-vault-pass
-ansible-playbook -i inventory.ini ipa.yml --ask-vault-pass
-ansible-playbook -i inventory.ini ipa.yml --tags hbac --ask-vault-pass
+ansible-playbook -i inventories/sbox/hosts.ini ipa.yml --tags bootstrap --ask-vault-pass
+ansible-playbook -i inventories/sbox/hosts.ini ipa.yml
+ansible-playbook -i inventories/sbox/hosts.ini ipa.yml --tags hbac
 ```
 
-**Check after bootstrap**
+Routine runs need no vault password — that's what the keytab buys.
+
+**Set `svc_ansible_principal` to whatever you actually named the account.** The variable carries through every task.
+
+**Confirm idempotency, which is the point of the split**
 
 ```bash
-ipa user-show svc-ansible --all | grep -i expiration   # expect 20380119031407Z
-ipa group-show admins                                   # expect admin and svc-ansible
+ansible-playbook -i inventories/sbox/hosts.ini ipa.yml --tags bootstrap --ask-vault-pass
+kvno svc-ansible-kt
+ansible-playbook -i inventories/sbox/hosts.ini ipa.yml --tags bootstrap --ask-vault-pass
+kvno svc-ansible-kt
 ```
 
-Two things not to change without thinking: `action: member` on the admins task (without it the module manages the whole member list and can remove `admin`), and the order of the `ipauser` and `--setattr` tasks (the password set re-triggers forced expiry each bootstrap; the setattr clears it).
+Same kvno, and the re-key block skipped on the second run. If it fires every time, something still writes the key each bootstrap — check that no `password:` crept back onto the `ipauser` task.
+
+**Possibly droppable**
+
+The `--setattr` sentinel. With no password on the account it may not get stamped at all:
+
+```bash
+ipa user-show svc-ansible-kt --all | grep -i expiration
+```
+
+If nothing appears, remove that task. If a real date does, keep it.
